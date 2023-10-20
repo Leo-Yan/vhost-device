@@ -149,6 +149,8 @@ impl<T: Read> VuRngBackend<T> {
                         if timer.quota_remaining == 0 {
                             let to_sleep = timer.period_ms - elapsed;
 
+                            println!("Reached entropy quota for the current period");
+
                             sleep(Duration::from_millis(to_sleep as u64));
                             timer.period_start = Instant::now();
                             timer.quota_remaining = timer.max_bytes;
@@ -171,6 +173,8 @@ impl<T: Read> VuRngBackend<T> {
                 .memory()
                 .read_from(descriptor.addr(), &mut *rng_source, to_read)
                 .map_err(|_| VuRngError::UnexpectedRngSourceError)?;
+
+            println!("Giving out {0} byte of entropy", len);
 
             timer.quota_remaining -= len;
 
