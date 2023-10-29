@@ -8,4 +8,8 @@ members = [
     "vhost-device-scsi",
     "vhost-device-scmi",
     "vhost-device-vsock",
+    "vhost-device-input",
 ]
+
+[env]
+pkg-config = "/home/leoy/Dev1/orko/libgpiod/install/lib/pkgconfig/"
