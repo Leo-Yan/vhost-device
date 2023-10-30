@@ -6,24 +6,10 @@
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
 use evdev::Device;
-use evdev::EventType;
-use evdev::InputId;
-use evdev::KeyCode;
-use libc::_PC_NAME_MAX;
-use log::warn;
-use nix::{
-    convert_ioctl_res, ioctl_none, ioctl_read, ioctl_read_buf, ioctl_readwrite, ioctl_write_int,
-    ioctl_write_ptr, request_code_read,
-};
+use nix::ioctl_read_buf;
 use std::fs::File;
-use std::io::Read;
-use std::mem;
-use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
 use std::{convert, io, result};
 
 use thiserror::Error as ThisError;
@@ -43,9 +29,7 @@ use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 const QUEUE_SIZE: usize = 1024;
 const NUM_QUEUES: usize = 2;
 
-const VIRTIO_INPUT_CFG_UNSET: u8 = 0x00;
 const VIRTIO_INPUT_CFG_ID_NAME: u8 = 0x01;
-const VIRTIO_INPUT_CFG_ID_SERIAL: u8 = 0x02;
 const VIRTIO_INPUT_CFG_ID_DEVIDS: u8 = 0x03;
 const VIRTIO_INPUT_CFG_PROP_BITS: u8 = 0x10;
 const VIRTIO_INPUT_CFG_EV_BITS: u8 = 0x11;
@@ -65,6 +49,16 @@ const SW_CNT: u32 = 0x11;
 
 type Result<T> = std::result::Result<T, VuInputError>;
 type InputDescriptorChain = DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap<()>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub(crate) struct VuInputConfig {
+    select: u8,
+    subsel: u8,
+    size: u8,
+    reserved: [u8; 5],
+    val: [u8; 128],
+}
 
 #[derive(Debug, Eq, PartialEq, ThisError)]
 /// Errors related to vhost-device-rng daemon.
@@ -92,7 +86,6 @@ pub(crate) enum VuInputError {
 }
 
 ioctl_read_buf!(eviocgname, b'E', 0x06, u8);
-ioctl_read_buf!(eviocgbit_type, b'E', 0x20, u8);
 ioctl_read_buf!(eviocgbit_key, b'E', 0x21, u8);
 ioctl_read_buf!(eviocgbit_relative, b'E', 0x22, u8);
 ioctl_read_buf!(eviocgbit_absolute, b'E', 0x23, u8);
@@ -103,65 +96,6 @@ impl convert::From<VuInputError> for io::Error {
     fn from(e: VuInputError) -> Self {
         io::Error::new(io::ErrorKind::Other, e)
     }
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct VuInputAbsinfo {
-    min: u32,
-    max: u32,
-    fuzz: u32,
-    flat: u32,
-    res: u32,
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct VuInputDevids {
-    bustype: u16,
-    vendor: u16,
-    product: u16,
-    version: u16,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct VuInputConfig {
-    select: u8,
-    subsel: u8,
-    size: u8,
-    reserved: [u8; 5],
-    val: [u8; 128],
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct VuInputConfigName {
-    select: u8,
-    subsel: u8,
-    size: u8,
-    reserved: [u8; 5],
-    name: [u8; 128],
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct VuInputConfigBitMap {
-    select: u8,
-    subsel: u8,
-    size: u8,
-    reserved: [u8; 5],
-    bitmap: [u8; 128],
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct VuInputConfigDevId {
-    select: u8,
-    subsel: u8,
-    size: u8,
-    reserved: [u8; 5],
-    devids: [u8; 128],
 }
 
 unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
@@ -219,7 +153,7 @@ impl VuInputBackend {
         Ok(true)
     }
 
-    pub fn event_config(&self) -> VuInputConfig {
+    pub fn create_event_config(&self) -> VuInputConfig {
         let ev_type = self.subsel;
         let f = File::open(self.ev_dev.clone()).unwrap();
         let fd = OwnedFd::from(f);
@@ -277,6 +211,42 @@ impl VuInputBackend {
         println!("VuInputConfig: {:?}", config);
         config
     }
+
+    pub fn create_name_config(&self) -> VuInputConfig {
+        let f = File::open(self.ev_dev.clone()).unwrap();
+        let fd = OwnedFd::from(f);
+
+        let mut name: Vec<u8> = vec![0; 128];
+        unsafe { eviocgname(fd.as_raw_fd(), &mut name).unwrap() };
+
+        let str_len = String::from_utf8(name.clone()).unwrap().len();
+
+        VuInputConfig {
+            select: VIRTIO_INPUT_CFG_ID_NAME,
+            subsel: 0,
+            size: str_len as u8,
+            reserved: [0; 5],
+            val: name.try_into().unwrap(),
+        }
+    }
+
+    pub fn create_id_config(&self) -> VuInputConfig {
+        let f = File::open(self.ev_dev.clone()).unwrap();
+        let fd = OwnedFd::from(f);
+        let ev_dev_file = Device::from_fd(fd).unwrap();
+
+        let input_id = ev_dev_file.input_id();
+        let mut dev_id = unsafe { any_as_u8_slice(&input_id).to_vec() };
+        dev_id.resize(128, 0);
+
+        VuInputConfig {
+            select: VIRTIO_INPUT_CFG_ID_DEVIDS,
+            subsel: 0,
+            size: 128,
+            reserved: [0; 5],
+            val: dev_id.try_into().unwrap(),
+        }
+    }
 }
 
 /// VhostUserBackend trait methods
@@ -314,55 +284,20 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
             offset, size, self.select, self.subsel
         );
 
+        let v: Vec<u8>;
+
         match self.select {
-            VIRTIO_INPUT_CFG_ID_NAME => {
-                let f = File::open(self.ev_dev.clone()).unwrap();
-                let fd = OwnedFd::from(f);
-
-                let mut name: Vec<u8> = vec![0; 128];
-                unsafe { eviocgname(fd.as_raw_fd(), &mut name).unwrap() };
-
-                let str_len = String::from_utf8(name.clone()).unwrap().len();
-
-                let v = VuInputConfig {
-                    select: VIRTIO_INPUT_CFG_ID_NAME,
-                    subsel: 0,
-                    size: str_len as u8,
-                    reserved: [0; 5],
-                    val: name.try_into().unwrap(),
-                };
-
-                unsafe { any_as_u8_slice(&v).to_vec() }
-            }
-            VIRTIO_INPUT_CFG_ID_DEVIDS => {
-                let f = File::open(self.ev_dev.clone()).unwrap();
-                let fd = OwnedFd::from(f);
-                let ev_dev_file = Device::from_fd(fd).unwrap();
-
-                let input_id = ev_dev_file.input_id();
-                let mut dev_id = unsafe { any_as_u8_slice(&input_id).to_vec() };
-                dev_id.resize(128, 0);
-
-                let v = VuInputConfig {
-                    select: VIRTIO_INPUT_CFG_ID_DEVIDS,
-                    subsel: 0,
-                    size: 128,
-                    reserved: [0; 5],
-                    val: dev_id.try_into().unwrap(),
-                };
-
-                let val = unsafe { any_as_u8_slice(&v).to_vec() };
-                val
-            }
-            VIRTIO_INPUT_CFG_EV_BITS => {
-                let v = self.event_config();
-
-                let val = unsafe { any_as_u8_slice(&v).to_vec() };
-                println!("select:{} subsel:{} val:{:?}", v.select, v.subsel, val);
-                val
-            }
+            VIRTIO_INPUT_CFG_ID_NAME => unsafe {
+                any_as_u8_slice(&self.create_name_config()).to_vec()
+            },
+            VIRTIO_INPUT_CFG_ID_DEVIDS => unsafe {
+                any_as_u8_slice(&self.create_id_config()).to_vec()
+            },
+            VIRTIO_INPUT_CFG_EV_BITS => unsafe {
+                any_as_u8_slice(&self.create_event_config()).to_vec()
+            },
             _ => {
-                let v: Vec<u8> = vec![0; size as usize];
+                v = vec![0; size as usize];
                 v
             }
         }
