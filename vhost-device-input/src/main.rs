@@ -3,9 +3,13 @@
 // Leo Yan <leo.yan@linaro.org>
 //
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
+
 mod vhu_input;
 
 use log::{error, info, warn};
+use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::process::exit;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -16,8 +20,12 @@ use vhost::{vhost_user, vhost_user::Listener};
 use vhost_user_backend::VhostUserDaemon;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
+use epoll;
+use evdev::Device;
 use vhu_input::VuInputBackend;
-//use evdev;
+use vmm_sys_util::epoll::EventSet;
+
+use vm_memory::bitmap::BitmapSlice;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -67,7 +75,7 @@ impl TryFrom<InputArgs> for VuInputConfig {
 }
 
 pub(crate) fn start_backend(config: VuInputConfig) -> Result<()> {
-    //let mut ev_dev = evdev::Device::open("/dev/input/event20").unwrap();
+    //let mut ev_dev = evdev::Device::open(config.event_device.to_owned()).unwrap();
     //println!("{ev_dev}");
     //loop {
     //    for ev in ev_dev.fetch_events().unwrap() {
@@ -75,17 +83,18 @@ pub(crate) fn start_backend(config: VuInputConfig) -> Result<()> {
     //    }
     //}
 
-    let ev_dev = String::from("/dev/input/event20");
-
     let socket = format!("{}", config.socket_path.to_owned());
 
     let handle: JoinHandle<Result<()>> = thread::spawn(move || loop {
+        let ev_dev = evdev::Device::open(config.event_device.to_owned()).unwrap();
+        let raw_fd = ev_dev.as_raw_fd();
+
         // If creating the VuRngBackend isn't successull there isn't much else to do than
         // killing the thread, which .unwrap() does.  When that happens an error code is
         // generated and displayed by the runtime mechanic.  Killing a thread doesn't affect
         // the other threads spun-off by the daemon.
         let vu_input_backend = Arc::new(RwLock::new(
-            VuInputBackend::new(ev_dev.clone()).map_err(Error::CouldNotCreateBackend)?,
+            VuInputBackend::new(ev_dev).map_err(Error::CouldNotCreateBackend)?,
         ));
 
         let mut daemon = VhostUserDaemon::new(
@@ -94,6 +103,11 @@ pub(crate) fn start_backend(config: VuInputConfig) -> Result<()> {
             GuestMemoryAtomic::new(GuestMemoryMmap::new()),
         )
         .map_err(Error::CouldNotCreateDaemon)?;
+
+        println!("XXXXXXXXXXXXXXX");
+        let handlers = daemon.get_epoll_handlers();
+        let ret = handlers[0].register_listener(raw_fd, EventSet::IN, 3);
+        println!("register_listener result: {:?}", ret);
 
         let listener = Listener::new(socket.clone(), true).unwrap();
         daemon.start(listener).unwrap();
@@ -111,6 +125,14 @@ pub(crate) fn start_backend(config: VuInputConfig) -> Result<()> {
                 warn!("Error running daemon: {:?}", e);
             }
         }
+
+        // No matter the result, we need to shut down the worker thread.
+        vu_input_backend
+            .read()
+            .unwrap()
+            .exit_event
+            .write(1)
+            .expect("Shutting down worker thread");
     });
 
     handle.join().map_err(|_| Error::FailedJoiningThreads)??;

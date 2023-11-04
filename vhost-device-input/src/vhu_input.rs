@@ -11,15 +11,19 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::{convert, io, result};
+use virtio_queue::QueueT;
 
 use thiserror::Error as ThisError;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackendMut, VringRwLock, VringT};
-use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
+
+use backtrace::Backtrace;
+use virtio_bindings::bindings::virtio_config::{VIRTIO_F_RING_RESET, VIRTIO_F_VERSION_1};
 use virtio_bindings::bindings::virtio_ring::{
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
 };
 use virtio_queue::{DescriptorChain, QueueOwnedT};
+
 use vm_memory::{
     Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
 };
@@ -49,6 +53,14 @@ const SW_CNT: u32 = 0x11;
 
 type Result<T> = std::result::Result<T, VuInputError>;
 type InputDescriptorChain = DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap<()>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub(crate) struct VuInputEvent {
+    ev_type: u16,
+    code: u16,
+    value: u32,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -103,22 +115,22 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
 }
 
 pub(crate) struct VuInputBackend {
-    ev_dev: String,
+    ev_dev: Device,
     pub exit_event: EventFd,
-    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     select: u8,
     subsel: u8,
+    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
 }
 
 impl VuInputBackend {
     /// Create a new virtio rng device that gets random data from /dev/urandom.
-    pub fn new(ev_dev: String) -> std::result::Result<Self, std::io::Error> {
+    pub fn new(ev_dev: Device) -> std::result::Result<Self, std::io::Error> {
         Ok(VuInputBackend {
             ev_dev,
             exit_event: EventFd::new(EFD_NONBLOCK).map_err(|_| VuInputError::EventFdError)?,
-            mem: None,
             select: 0,
             subsel: 0,
+            mem: None,
         })
     }
 
@@ -155,8 +167,7 @@ impl VuInputBackend {
 
     pub fn create_event_config(&self) -> VuInputConfig {
         let ev_type = self.subsel;
-        let f = File::open(self.ev_dev.clone()).unwrap();
-        let fd = OwnedFd::from(f);
+        let ev_fd: i32 = self.ev_dev.as_raw_fd();
         let mut prop: Vec<u8>;
         let mut counter: u8 = 0;
         let mut index: u8 = 0;
@@ -164,27 +175,27 @@ impl VuInputBackend {
         match ev_type {
             EV_KEY => {
                 let mut keys: [u8; KEY_CNT as usize] = [0; KEY_CNT as usize];
-                unsafe { eviocgbit_key(fd.as_raw_fd(), &mut keys).unwrap() };
+                unsafe { eviocgbit_key(ev_fd, &mut keys).unwrap() };
                 prop = keys.to_vec();
             }
             EV_ABS => {
                 let mut abs: [u8; ABS_CNT as usize] = [0; ABS_CNT as usize];
-                unsafe { eviocgbit_absolute(fd.as_raw_fd(), &mut abs).unwrap() };
+                unsafe { eviocgbit_absolute(ev_fd, &mut abs).unwrap() };
                 prop = abs.to_vec();
             }
             EV_REL => {
                 let mut rel: [u8; REL_CNT as usize] = [0; REL_CNT as usize];
-                unsafe { eviocgbit_relative(fd.as_raw_fd(), &mut rel).unwrap() };
+                unsafe { eviocgbit_relative(ev_fd, &mut rel).unwrap() };
                 prop = rel.to_vec();
             }
             EV_MSC => {
                 let mut msc: [u8; MSC_CNT as usize] = [0; MSC_CNT as usize];
-                unsafe { eviocgbit_misc(fd.as_raw_fd(), &mut msc).unwrap() };
+                unsafe { eviocgbit_misc(ev_fd, &mut msc).unwrap() };
                 prop = msc.to_vec();
             }
             EV_SW => {
                 let mut sw: [u8; SW_CNT as usize] = [0; SW_CNT as usize];
-                unsafe { eviocgbit_switch(fd.as_raw_fd(), &mut sw).unwrap() };
+                unsafe { eviocgbit_switch(ev_fd, &mut sw).unwrap() };
                 prop = sw.to_vec();
             }
             _ => {
@@ -208,16 +219,15 @@ impl VuInputBackend {
             reserved: [0; 5],
             val: prop.try_into().unwrap(),
         };
-        println!("VuInputConfig: {:?}", config);
+        //println!("VuInputConfig: {:?}", config);
         config
     }
 
     pub fn create_name_config(&self) -> VuInputConfig {
-        let f = File::open(self.ev_dev.clone()).unwrap();
-        let fd = OwnedFd::from(f);
+        let ev_fd: i32 = self.ev_dev.as_raw_fd();
 
         let mut name: Vec<u8> = vec![0; 128];
-        unsafe { eviocgname(fd.as_raw_fd(), &mut name).unwrap() };
+        unsafe { eviocgname(ev_fd, &mut name).unwrap() };
 
         let str_len = String::from_utf8(name.clone()).unwrap().len();
 
@@ -231,11 +241,7 @@ impl VuInputBackend {
     }
 
     pub fn create_id_config(&self) -> VuInputConfig {
-        let f = File::open(self.ev_dev.clone()).unwrap();
-        let fd = OwnedFd::from(f);
-        let ev_dev_file = Device::from_fd(fd).unwrap();
-
-        let input_id = ev_dev_file.input_id();
+        let input_id = self.ev_dev.input_id();
         let mut dev_id = unsafe { any_as_u8_slice(&input_id).to_vec() };
         dev_id.resize(128, 0);
 
@@ -263,19 +269,17 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
 
     fn features(&self) -> u64 {
         // this matches the current libvhost defaults except VHOST_F_LOG_ALL
-        1 << VIRTIO_F_VERSION_1
-            | 1 << VIRTIO_INPUT_CFG_ID_NAME
-            | 1 << VIRTIO_INPUT_CFG_ID_DEVIDS
-            | 1 << VIRTIO_INPUT_CFG_PROP_BITS
-            | 1 << VIRTIO_INPUT_CFG_EV_BITS
-            | 1 << VIRTIO_INPUT_CFG_ABS_INFO
+        1 << VIRTIO_F_RING_RESET
+            | 1 << VIRTIO_F_VERSION_1
+            | 1 << VIRTIO_RING_F_INDIRECT_DESC
+            | 1 << VIRTIO_RING_F_EVENT_IDX
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         println!("protocol_features");
 
-        VhostUserProtocolFeatures::CONFIG
+        VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -304,6 +308,8 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
     }
 
     fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> io::Result<()> {
+        //let bt = Backtrace::new();
+
         self.select = _buf[0];
         self.subsel = _buf[1];
 
@@ -339,6 +345,73 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         if evset != EventSet::IN {
             return Err(VuInputError::HandleEventNotEpollIn.into());
         }
+
+        let evs = self.ev_dev.fetch_events().unwrap();
+
+        //for ev in self.ev_dev.fetch_events().unwrap() {
+        //    println!("{ev:?}");
+        //}
+
+        let vring = &vrings[0];
+
+        //let mut requests = vring
+        //    .get_mut()
+        //    .get_queue_mut()
+        //    .iter(mem)
+        //    .map_err(|_| VuInputError::DescriptorNotFound)
+        //    .unwrap();
+
+        //let mut item = requests.next();
+        //println!("item:{:?}", item);
+
+        let next_avail = vring.queue_next_avail();
+        println!("next_avail:{:?}", next_avail);
+
+        let queue_used_idx = vring.queue_used_idx().unwrap();
+        println!("queue used idx: {}", queue_used_idx);
+
+        for ev in evs {
+            let ev_raw_data = VuInputEvent {
+                ev_type: ev.event_type().0,
+                code: ev.code(),
+                value: ev.value() as u32,
+            };
+            println!("{ev_raw_data:?}");
+
+            let mem = self.mem.as_ref().unwrap().memory();
+
+            let desc = vring
+                .get_mut()
+                .get_queue_mut()
+                .pop_descriptor_chain(mem)
+                .unwrap();
+
+            println!("desc: {:?}", desc);
+
+            let descriptors: Vec<_> = desc.clone().collect();
+
+            if descriptors.len() != 1 {
+                println!("desc length is not 1");
+            }
+
+            let descriptor = descriptors[0];
+
+            let ev_data = unsafe { any_as_u8_slice(&ev_raw_data) };
+
+            let len = desc.memory().write(ev_data, descriptor.addr()).unwrap();
+
+            println!("Sent out {0} byte", len);
+
+            if vring.add_used(desc.head_index(), len as u32).is_err() {
+                println!("Couldn't return used descriptors to the ring");
+            }
+        }
+
+        vring
+            .signal_used_queue()
+            .map_err(|_| VuInputError::SendNotificationFailed)?;
+
+        println!("handle_event: exit!");
 
         Ok(false)
     }
