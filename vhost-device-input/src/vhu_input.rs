@@ -51,6 +51,8 @@ const ABS_CNT: u32 = 0x40;
 const MSC_CNT: u32 = 0x08;
 const SW_CNT: u32 = 0x11;
 
+const VIRTIO_INPUT_CFG_SIZE: usize = 128;
+
 type Result<T> = std::result::Result<T, VuInputError>;
 type InputDescriptorChain = DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap<()>>>;
 
@@ -69,7 +71,7 @@ pub(crate) struct VuInputConfig {
     subsel: u8,
     size: u8,
     reserved: [u8; 5],
-    val: [u8; 128],
+    val: [u8; VIRTIO_INPUT_CFG_SIZE],
 }
 
 #[derive(Debug, Eq, PartialEq, ThisError)]
@@ -115,6 +117,7 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
 }
 
 pub(crate) struct VuInputBackend {
+    event_idx: bool,
     ev_dev: Device,
     pub exit_event: EventFd,
     select: u8,
@@ -123,9 +126,9 @@ pub(crate) struct VuInputBackend {
 }
 
 impl VuInputBackend {
-    /// Create a new virtio rng device that gets random data from /dev/urandom.
     pub fn new(ev_dev: Device) -> std::result::Result<Self, std::io::Error> {
         Ok(VuInputBackend {
+            event_idx: false,
             ev_dev,
             exit_event: EventFd::new(EFD_NONBLOCK).map_err(|_| VuInputError::EventFdError)?,
             select: 0,
@@ -165,7 +168,7 @@ impl VuInputBackend {
         Ok(true)
     }
 
-    pub fn create_event_config(&self) -> VuInputConfig {
+    pub fn read_event_config(&self) -> Result<VuInputConfig> {
         let ev_type = self.subsel;
         let ev_fd: i32 = self.ev_dev.as_raw_fd();
         let mut prop: Vec<u8>;
@@ -199,11 +202,11 @@ impl VuInputBackend {
                 prop = sw.to_vec();
             }
             _ => {
-                prop = vec![0; 128];
+                prop = vec![0; VIRTIO_INPUT_CFG_SIZE];
             }
         }
 
-        prop.resize(128, 0);
+        prop.resize(VIRTIO_INPUT_CFG_SIZE, 0);
 
         for val in prop.iter() {
             index += 1;
@@ -212,46 +215,55 @@ impl VuInputBackend {
             }
         }
 
-        let config = VuInputConfig {
+        Ok(VuInputConfig {
             select: VIRTIO_INPUT_CFG_ID_DEVIDS,
             subsel: ev_type,
             size: counter,
             reserved: [0; 5],
             val: prop.try_into().unwrap(),
-        };
-        //println!("VuInputConfig: {:?}", config);
-        config
+        })
     }
 
-    pub fn create_name_config(&self) -> VuInputConfig {
-        let ev_fd: i32 = self.ev_dev.as_raw_fd();
+    pub fn read_name_config(&self) -> Result<VuInputConfig> {
+        let mut name: [u8; VIRTIO_INPUT_CFG_SIZE] = [0; VIRTIO_INPUT_CFG_SIZE];
 
-        let mut name: Vec<u8> = vec![0; 128];
-        unsafe { eviocgname(ev_fd, &mut name).unwrap() };
+        match unsafe { eviocgname(self.ev_dev.as_raw_fd(), name.as_mut_slice()) } {
+            Ok(len) if len as usize > name.len() => {
+                return Err(VuInputError::UnexpectedInputDeviceError);
+            }
+            Ok(len) if len <= 1 => {
+                return Err(VuInputError::UnexpectedInputDeviceError);
+            }
+            Err(_) => {
+                return Err(VuInputError::UnexpectedInputDeviceError);
+            }
+            _ => (),
+        }
 
-        let str_len = String::from_utf8(name.clone()).unwrap().len();
+        let size = String::from_utf8(name.to_vec()).unwrap().len();
 
-        VuInputConfig {
+        Ok(VuInputConfig {
             select: VIRTIO_INPUT_CFG_ID_NAME,
             subsel: 0,
-            size: str_len as u8,
+            size: size as u8,
             reserved: [0; 5],
-            val: name.try_into().unwrap(),
-        }
+            val: name,
+        })
     }
 
-    pub fn create_id_config(&self) -> VuInputConfig {
+    pub fn read_id_config(&self) -> Result<VuInputConfig> {
         let input_id = self.ev_dev.input_id();
         let mut dev_id = unsafe { any_as_u8_slice(&input_id).to_vec() };
-        dev_id.resize(128, 0);
 
-        VuInputConfig {
+        dev_id.resize(VIRTIO_INPUT_CFG_SIZE, 0);
+
+        Ok(VuInputConfig {
             select: VIRTIO_INPUT_CFG_ID_DEVIDS,
             subsel: 0,
-            size: 128,
+            size: VIRTIO_INPUT_CFG_SIZE as u8,
             reserved: [0; 5],
             val: dev_id.try_into().unwrap(),
-        }
+        })
     }
 }
 
@@ -268,18 +280,15 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
     }
 
     fn features(&self) -> u64 {
-        // this matches the current libvhost defaults except VHOST_F_LOG_ALL
-        1 << VIRTIO_F_RING_RESET
-            | 1 << VIRTIO_F_VERSION_1
+        1 << VIRTIO_F_VERSION_1
             | 1 << VIRTIO_RING_F_INDIRECT_DESC
             | 1 << VIRTIO_RING_F_EVENT_IDX
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
-        println!("protocol_features");
-
-        VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG
+        VhostUserProtocolFeatures::MQ |
+        VhostUserProtocolFeatures::CONFIG
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -288,40 +297,43 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
             offset, size, self.select, self.subsel
         );
 
-        let v: Vec<u8>;
+        let ret;
 
         match self.select {
-            VIRTIO_INPUT_CFG_ID_NAME => unsafe {
-                any_as_u8_slice(&self.create_name_config()).to_vec()
+            VIRTIO_INPUT_CFG_ID_NAME => {
+                ret = self.read_name_config();
             },
-            VIRTIO_INPUT_CFG_ID_DEVIDS => unsafe {
-                any_as_u8_slice(&self.create_id_config()).to_vec()
+            VIRTIO_INPUT_CFG_ID_DEVIDS => {
+                ret = self.read_id_config();
             },
-            VIRTIO_INPUT_CFG_EV_BITS => unsafe {
-                any_as_u8_slice(&self.create_event_config()).to_vec()
+            VIRTIO_INPUT_CFG_EV_BITS => {
+                ret = self.read_event_config();
             },
             _ => {
-                v = vec![0; size as usize];
-                v
+                ret = Err(VuInputError::EventFdError);
+            }
+        }
+
+        match ret {
+            Ok(cfg) => unsafe {
+                any_as_u8_slice(&cfg).to_vec()
+            }
+            _ => {
+                vec![0, size as u8]
             }
         }
     }
 
-    fn set_config(&mut self, _offset: u32, _buf: &[u8]) -> io::Result<()> {
-        //let bt = Backtrace::new();
+    fn set_config(&mut self, offset: u32, buf: &[u8]) -> io::Result<()> {
+        self.select = buf[0];
+        self.subsel = buf[1];
 
-        self.select = _buf[0];
-        self.subsel = _buf[1];
-
-        println!(
-            "set_config: offset:{} select:{} subsel:{}",
-            _offset, self.select, self.subsel
-        );
         Ok(())
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
         println!("set_event_idx: enabled={}", enabled);
+        dbg!(self.event_idx = enabled);
     }
 
     fn update_memory(
@@ -341,6 +353,10 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         _thread_id: usize,
     ) -> result::Result<bool, io::Error> {
         println!("handle_event");
+
+        if self.event_idx == false {
+            return Ok(false);
+        }
 
         if evset != EventSet::IN {
             return Err(VuInputError::HandleEventNotEpollIn.into());
