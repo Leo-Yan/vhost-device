@@ -169,46 +169,40 @@ impl VuInputBackend {
     }
 
     pub fn read_event_config(&self) -> Result<VuInputConfig> {
-        let ev_type = self.subsel;
-        let ev_fd: i32 = self.ev_dev.as_raw_fd();
-        let mut prop: Vec<u8>;
         let mut counter: u8 = 0;
         let mut index: u8 = 0;
+        let mut cfg: [u8; VIRTIO_INPUT_CFG_SIZE] = [0; VIRTIO_INPUT_CFG_SIZE];
+        let func: unsafe fn(nix::libc::c_int, &mut [u8]) -> nix::Result<libc::c_int>;
 
-        match ev_type {
+        match self.subsel {
             EV_KEY => {
-                let mut keys: [u8; KEY_CNT as usize] = [0; KEY_CNT as usize];
-                unsafe { eviocgbit_key(ev_fd, &mut keys).unwrap() };
-                prop = keys.to_vec();
+                func = eviocgbit_key;
             }
             EV_ABS => {
-                let mut abs: [u8; ABS_CNT as usize] = [0; ABS_CNT as usize];
-                unsafe { eviocgbit_absolute(ev_fd, &mut abs).unwrap() };
-                prop = abs.to_vec();
+                func = eviocgbit_absolute;
             }
             EV_REL => {
-                let mut rel: [u8; REL_CNT as usize] = [0; REL_CNT as usize];
-                unsafe { eviocgbit_relative(ev_fd, &mut rel).unwrap() };
-                prop = rel.to_vec();
+                func = eviocgbit_relative;
             }
             EV_MSC => {
-                let mut msc: [u8; MSC_CNT as usize] = [0; MSC_CNT as usize];
-                unsafe { eviocgbit_misc(ev_fd, &mut msc).unwrap() };
-                prop = msc.to_vec();
+                func = eviocgbit_misc;
             }
             EV_SW => {
-                let mut sw: [u8; SW_CNT as usize] = [0; SW_CNT as usize];
-                unsafe { eviocgbit_switch(ev_fd, &mut sw).unwrap() };
-                prop = sw.to_vec();
+                func = eviocgbit_switch;
             }
             _ => {
-                prop = vec![0; VIRTIO_INPUT_CFG_SIZE];
+                return Err(VuInputError::HandleEventUnknownEvent);
             }
         }
 
-        prop.resize(VIRTIO_INPUT_CFG_SIZE, 0);
+        match unsafe { func(self.ev_dev.as_raw_fd(), &mut cfg) } {
+            Err(_) => {
+                return Err(VuInputError::UnexpectedInputDeviceError);
+            }
+            _ => (),
+        }
 
-        for val in prop.iter() {
+        for val in cfg.iter() {
             index += 1;
             if *val != 0 {
                 counter = index;
@@ -216,11 +210,11 @@ impl VuInputBackend {
         }
 
         Ok(VuInputConfig {
-            select: VIRTIO_INPUT_CFG_ID_DEVIDS,
-            subsel: ev_type,
+            select: self.select,
+            subsel: self.subsel,
             size: counter,
             reserved: [0; 5],
-            val: prop.try_into().unwrap(),
+            val: cfg,
         })
     }
 
@@ -243,7 +237,7 @@ impl VuInputBackend {
         let size = String::from_utf8(name.to_vec()).unwrap().len();
 
         Ok(VuInputConfig {
-            select: VIRTIO_INPUT_CFG_ID_NAME,
+            select: self.select,
             subsel: 0,
             size: size as u8,
             reserved: [0; 5],
@@ -292,34 +286,30 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
-        println!(
-            "get_config: offset:{} size:{} select:{} subsel:{}",
-            offset, size, self.select, self.subsel
-        );
-
-        let ret;
+        let cfg;
 
         match self.select {
             VIRTIO_INPUT_CFG_ID_NAME => {
-                ret = self.read_name_config();
+                cfg = self.read_name_config();
             },
             VIRTIO_INPUT_CFG_ID_DEVIDS => {
-                ret = self.read_id_config();
+                cfg = self.read_id_config();
             },
             VIRTIO_INPUT_CFG_EV_BITS => {
-                ret = self.read_event_config();
+                cfg = self.read_event_config();
             },
             _ => {
-                ret = Err(VuInputError::EventFdError);
+                // Return zeros for unsupported config types
+                return vec![0; size as usize];
             }
         }
 
-        match ret {
-            Ok(cfg) => unsafe {
-                any_as_u8_slice(&cfg).to_vec()
+        match cfg {
+            Ok(val) => unsafe {
+                any_as_u8_slice(&val).to_vec()
             }
             _ => {
-                vec![0, size as u8]
+                vec![0; size as usize]
             }
         }
     }
