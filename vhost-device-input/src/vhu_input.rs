@@ -5,24 +5,21 @@
 //
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
-use evdev::Device;
 use nix::ioctl_read_buf;
-use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::os::fd::OwnedFd;
 use std::{convert, io, result};
-use virtio_queue::QueueT;
 
 use thiserror::Error as ThisError;
+
+use evdev::Device;
+
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackendMut, VringRwLock, VringT};
-
-use backtrace::Backtrace;
-use virtio_bindings::bindings::virtio_config::{VIRTIO_F_RING_RESET, VIRTIO_F_VERSION_1};
+use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_bindings::bindings::virtio_ring::{
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
 };
-use virtio_queue::{DescriptorChain, QueueOwnedT};
+use virtio_queue::{DescriptorChain, QueueOwnedT, QueueT};
 
 use vm_memory::{
     Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
@@ -30,39 +27,25 @@ use vm_memory::{
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
+type Result<T> = std::result::Result<T, VuInputError>;
+type InputDescriptorChain = DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap<()>>>;
+
 const QUEUE_SIZE: usize = 1024;
 const NUM_QUEUES: usize = 2;
 
 const VIRTIO_INPUT_CFG_ID_NAME: u8 = 0x01;
 const VIRTIO_INPUT_CFG_ID_DEVIDS: u8 = 0x03;
-const VIRTIO_INPUT_CFG_PROP_BITS: u8 = 0x10;
 const VIRTIO_INPUT_CFG_EV_BITS: u8 = 0x11;
-const VIRTIO_INPUT_CFG_ABS_INFO: u8 = 0x12;
+const VIRTIO_INPUT_CFG_SIZE: usize = 128;
 
+const EV_SYN: u8 = 0x00;
 const EV_KEY: u8 = 0x01;
 const EV_REL: u8 = 0x02;
 const EV_ABS: u8 = 0x03;
 const EV_MSC: u8 = 0x04;
 const EV_SW: u8 = 0x05;
 
-const KEY_CNT: u32 = 0x300;
-const REL_CNT: u32 = 0x10;
-const ABS_CNT: u32 = 0x40;
-const MSC_CNT: u32 = 0x08;
-const SW_CNT: u32 = 0x11;
-
-const VIRTIO_INPUT_CFG_SIZE: usize = 128;
-
-type Result<T> = std::result::Result<T, VuInputError>;
-type InputDescriptorChain = DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap<()>>>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct VuInputEvent {
-    ev_type: u16,
-    code: u16,
-    value: u32,
-}
+const SYN_REPORT: u8 = 0x00;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -72,6 +55,14 @@ pub(crate) struct VuInputConfig {
     size: u8,
     reserved: [u8; 5],
     val: [u8; VIRTIO_INPUT_CFG_SIZE],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub(crate) struct VuInputEvent {
+    ev_type: u16,
+    code: u16,
+    value: u32,
 }
 
 #[derive(Debug, Eq, PartialEq, ThisError)]
@@ -123,6 +114,7 @@ pub(crate) struct VuInputBackend {
     select: u8,
     subsel: u8,
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    ev_list: Vec<VuInputEvent>,
 }
 
 impl VuInputBackend {
@@ -134,6 +126,7 @@ impl VuInputBackend {
             select: 0,
             subsel: 0,
             mem: None,
+            ev_list: Vec::new(),
         })
     }
 
@@ -151,19 +144,69 @@ impl VuInputBackend {
 
     /// Process the requests in the vring and dispatch replies
     fn process_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
-        let requests: Vec<_> = vring
-            .get_mut()
-            .get_queue_mut()
-            .iter(self.mem.as_ref().unwrap().memory())
-            .map_err(|_| VuInputError::DescriptorNotFound)?
-            .collect();
 
-        if self.process_requests(requests, vring)? {
-            // Send notification once all the requests are processed
-            vring
-                .signal_used_queue()
-                .map_err(|_| VuInputError::SendNotificationFailed)?;
+        let evs = self.ev_dev.fetch_events().unwrap();
+
+        for ev in evs {
+            let ev_raw_data = VuInputEvent {
+                ev_type: ev.event_type().0,
+                code: ev.code(),
+                value: ev.value() as u32,
+            };
+            println!("{ev_raw_data:?}");
+            //self.ev_list.push(ev_raw_data);
+
+            let next_avail = vring.queue_next_avail();
+            println!("next_avail:{:?}", next_avail);
+
+            let queue_used_idx = vring.queue_used_idx().unwrap();
+            println!("queue used idx: {}", queue_used_idx);
+
+            //for ev in &self.ev_list {
+            //let ev_raw_data = VuInputEvent {
+            //    ev_type: ev.event_type().0,
+            //    code: ev.code(),
+            //    value: ev.value() as u32,
+            //};
+            //println!("{ev_raw_data:?}");
+
+            // for ev in &self.ev_list {
+
+            // println!("ev: {:?}", ev);
+
+            let mem = self.mem.as_ref().unwrap().memory();
+
+            let desc = vring
+                .get_mut()
+                .get_queue_mut()
+                .pop_descriptor_chain(mem)
+                .unwrap();
+
+            //println!("desc: {:?}", desc);
+
+            let descriptors: Vec<_> = desc.clone().collect();
+
+            if descriptors.len() != 1 {
+                println!("desc length is not 1");
+            }
+
+            let descriptor = descriptors[0];
+
+            let ev_data = unsafe { any_as_u8_slice(&ev_raw_data) };
+            //let ev_data = unsafe { any_as_u8_slice(&ev) };
+
+            let len = desc.memory().write(ev_data, descriptor.addr()).unwrap();
+
+            println!("Sent out {0} byte", len);
+
+            if vring.add_used(desc.head_index(), len as u32).is_err() {
+                println!("Couldn't return used descriptors to the ring");
+            }
         }
+
+        vring
+            .signal_used_queue()
+            .map_err(|_| VuInputError::SendNotificationFailed)?;
 
         Ok(true)
     }
@@ -281,8 +324,7 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
-        VhostUserProtocolFeatures::MQ |
-        VhostUserProtocolFeatures::CONFIG
+        VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -291,13 +333,13 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         match self.select {
             VIRTIO_INPUT_CFG_ID_NAME => {
                 cfg = self.read_name_config();
-            },
+            }
             VIRTIO_INPUT_CFG_ID_DEVIDS => {
                 cfg = self.read_id_config();
-            },
+            }
             VIRTIO_INPUT_CFG_EV_BITS => {
                 cfg = self.read_event_config();
-            },
+            }
             _ => {
                 // Return zeros for unsupported config types
                 return vec![0; size as usize];
@@ -305,9 +347,7 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         }
 
         match cfg {
-            Ok(val) => unsafe {
-                any_as_u8_slice(&val).to_vec()
-            }
+            Ok(val) => unsafe { any_as_u8_slice(&val).to_vec() },
             _ => {
                 vec![0; size as usize]
             }
@@ -352,13 +392,9 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
             return Err(VuInputError::HandleEventNotEpollIn.into());
         }
 
-        let evs = self.ev_dev.fetch_events().unwrap();
-
-        //for ev in self.ev_dev.fetch_events().unwrap() {
-        //    println!("{ev:?}");
-        //}
-
         let vring = &vrings[0];
+
+        self.process_queue(vring)?;
 
         //let mut requests = vring
         //    .get_mut()
@@ -369,53 +405,6 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
 
         //let mut item = requests.next();
         //println!("item:{:?}", item);
-
-        let next_avail = vring.queue_next_avail();
-        println!("next_avail:{:?}", next_avail);
-
-        let queue_used_idx = vring.queue_used_idx().unwrap();
-        println!("queue used idx: {}", queue_used_idx);
-
-        for ev in evs {
-            let ev_raw_data = VuInputEvent {
-                ev_type: ev.event_type().0,
-                code: ev.code(),
-                value: ev.value() as u32,
-            };
-            println!("{ev_raw_data:?}");
-
-            let mem = self.mem.as_ref().unwrap().memory();
-
-            let desc = vring
-                .get_mut()
-                .get_queue_mut()
-                .pop_descriptor_chain(mem)
-                .unwrap();
-
-            println!("desc: {:?}", desc);
-
-            let descriptors: Vec<_> = desc.clone().collect();
-
-            if descriptors.len() != 1 {
-                println!("desc length is not 1");
-            }
-
-            let descriptor = descriptors[0];
-
-            let ev_data = unsafe { any_as_u8_slice(&ev_raw_data) };
-
-            let len = desc.memory().write(ev_data, descriptor.addr()).unwrap();
-
-            println!("Sent out {0} byte", len);
-
-            if vring.add_used(desc.head_index(), len as u32).is_err() {
-                println!("Couldn't return used descriptors to the ring");
-            }
-        }
-
-        vring
-            .signal_used_queue()
-            .map_err(|_| VuInputError::SendNotificationFailed)?;
 
         println!("handle_event: exit!");
 
