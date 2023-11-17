@@ -144,7 +144,6 @@ impl VuInputBackend {
 
     /// Process the requests in the vring and dispatch replies
     fn process_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
-
         let evs = self.ev_dev.fetch_events().unwrap();
 
         for ev in evs {
@@ -153,8 +152,8 @@ impl VuInputBackend {
                 code: ev.code(),
                 value: ev.value() as u32,
             };
-            println!("{ev_raw_data:?}");
-            //self.ev_list.push(ev_raw_data);
+
+        //for ev_raw_data in &self.ev_list {
 
             let next_avail = vring.queue_next_avail();
             println!("next_avail:{:?}", next_avail);
@@ -168,7 +167,7 @@ impl VuInputBackend {
             //    code: ev.code(),
             //    value: ev.value() as u32,
             //};
-            //println!("{ev_raw_data:?}");
+            println!("send event: {ev_raw_data:?}");
 
             // for ev in &self.ev_list {
 
@@ -176,15 +175,39 @@ impl VuInputBackend {
 
             let mem = self.mem.as_ref().unwrap().memory();
 
-            let desc = vring
+            println!("0000");
+
+            let mut desc = vring
                 .get_mut()
                 .get_queue_mut()
-                .pop_descriptor_chain(mem)
-                .unwrap();
+                .pop_descriptor_chain(mem.clone());
 
-            //println!("desc: {:?}", desc);
+            println!("xxxx");
 
-            let descriptors: Vec<_> = desc.clone().collect();
+            match desc {
+                None => {
+                    vring
+                        .signal_used_queue()
+                        .map_err(|_| VuInputError::SendNotificationFailed)?;
+
+                    //vring.get_mut().get_queue_mut().go_to_previous_position();
+                    //desc = vring
+                    //    .get_mut()
+                    //    .get_queue_mut()
+                    //    .pop_descriptor_chain(mem);
+                    return Ok(false);
+                }
+                _ => (),
+            }
+
+            println!("yyyy");
+
+            //println!("desc2: {:?}", desc2);
+            println!("1111");
+
+            let desc_chain = desc.unwrap();
+
+            let descriptors: Vec<_> = desc_chain.clone().collect();
 
             if descriptors.len() != 1 {
                 println!("desc length is not 1");
@@ -195,11 +218,13 @@ impl VuInputBackend {
             let ev_data = unsafe { any_as_u8_slice(&ev_raw_data) };
             //let ev_data = unsafe { any_as_u8_slice(&ev) };
 
-            let len = desc.memory().write(ev_data, descriptor.addr()).unwrap();
+            println!("2222");
+
+            let len = desc_chain.memory().write(ev_data, descriptor.addr()).unwrap();
 
             println!("Sent out {0} byte", len);
 
-            if vring.add_used(desc.head_index(), len as u32).is_err() {
+            if vring.add_used(desc_chain.head_index(), len as u32).is_err() {
                 println!("Couldn't return used descriptors to the ring");
             }
         }
@@ -385,12 +410,25 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         println!("handle_event");
 
         if self.event_idx == false {
+            self.ev_dev.fetch_events().unwrap();
             return Ok(false);
         }
 
         if evset != EventSet::IN {
             return Err(VuInputError::HandleEventNotEpollIn.into());
         }
+
+        //let evs = self.ev_dev.fetch_events().unwrap();
+
+        //for ev in evs {
+        //    let ev_raw_data = VuInputEvent {
+        //        ev_type: ev.event_type().0,
+        //        code: ev.code(),
+        //        value: ev.value() as u32,
+        //    };
+        //    println!("push event: {ev_raw_data:?}");
+        //    self.ev_list.push(ev_raw_data);
+        //}
 
         let vring = &vrings[0];
 
