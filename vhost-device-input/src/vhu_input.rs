@@ -5,13 +5,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
+use evdev::Device;
 use nix::ioctl_read_buf;
+use std::collections::VecDeque;
 use std::os::fd::AsRawFd;
 use std::{convert, io, result};
-
 use thiserror::Error as ThisError;
-
-use evdev::Device;
 
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackendMut, VringRwLock, VringT};
@@ -20,7 +19,6 @@ use virtio_bindings::bindings::virtio_ring::{
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
 };
 use virtio_queue::{DescriptorChain, QueueOwnedT, QueueT};
-
 use vm_memory::{
     Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
 };
@@ -114,7 +112,7 @@ pub(crate) struct VuInputBackend {
     select: u8,
     subsel: u8,
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
-    ev_list: Vec<VuInputEvent>,
+    ev_list: VecDeque<VuInputEvent>,
 }
 
 impl VuInputBackend {
@@ -126,7 +124,7 @@ impl VuInputBackend {
             select: 0,
             subsel: 0,
             mem: None,
-            ev_list: Vec::new(),
+            ev_list: VecDeque::new(),
         })
     }
 
@@ -142,68 +140,46 @@ impl VuInputBackend {
         Ok(true)
     }
 
-    /// Process the requests in the vring and dispatch replies
-    fn process_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
-        let evs = self.ev_dev.fetch_events().unwrap();
+    fn process_event_list(&mut self, vring: &VringRwLock) -> Result<bool> {
+        let mut index = 0;
+        let mut last_sync_index = 0;
 
-        for ev in evs {
-            let ev_raw_data = VuInputEvent {
-                ev_type: ev.event_type().0,
-                code: ev.code(),
-                value: ev.value() as u32,
-            };
+        for event in self.ev_list.iter() {
+            index += 1;
+            if event.ev_type == EV_SYN as u16 && event.code == SYN_REPORT as u16 {
+                last_sync_index = index;
+            }
+        }
 
-        //for ev_raw_data in &self.ev_list {
+        println!("last_sync_index: {}", last_sync_index);
 
-            let next_avail = vring.queue_next_avail();
-            println!("next_avail:{:?}", next_avail);
+        index = 0;
+        while index < last_sync_index {
+            let event: &VuInputEvent;
+            event = self.ev_list.get(index).unwrap();
+            index += 1;
 
-            let queue_used_idx = vring.queue_used_idx().unwrap();
-            println!("queue used idx: {}", queue_used_idx);
-
-            //for ev in &self.ev_list {
-            //let ev_raw_data = VuInputEvent {
-            //    ev_type: ev.event_type().0,
-            //    code: ev.code(),
-            //    value: ev.value() as u32,
-            //};
-            println!("send event: {ev_raw_data:?}");
-
-            // for ev in &self.ev_list {
-
-            // println!("ev: {:?}", ev);
+            println!("send event: {event:?}");
 
             let mem = self.mem.as_ref().unwrap().memory();
 
-            println!("0000");
-
-            let mut desc = vring
+            let desc = vring
                 .get_mut()
                 .get_queue_mut()
                 .pop_descriptor_chain(mem.clone());
 
-            println!("xxxx");
-
             match desc {
                 None => {
+                    self.ev_list.clear();
+
                     vring
                         .signal_used_queue()
                         .map_err(|_| VuInputError::SendNotificationFailed)?;
 
-                    //vring.get_mut().get_queue_mut().go_to_previous_position();
-                    //desc = vring
-                    //    .get_mut()
-                    //    .get_queue_mut()
-                    //    .pop_descriptor_chain(mem);
                     return Ok(false);
                 }
                 _ => (),
             }
-
-            println!("yyyy");
-
-            //println!("desc2: {:?}", desc2);
-            println!("1111");
 
             let desc_chain = desc.unwrap();
 
@@ -214,20 +190,52 @@ impl VuInputBackend {
             }
 
             let descriptor = descriptors[0];
+            let ev_data = unsafe { any_as_u8_slice(event) };
 
-            let ev_data = unsafe { any_as_u8_slice(&ev_raw_data) };
-            //let ev_data = unsafe { any_as_u8_slice(&ev) };
+            println!("event_data: {:?}", ev_data);
 
-            println!("2222");
-
-            let len = desc_chain.memory().write(ev_data, descriptor.addr()).unwrap();
-
-            println!("Sent out {0} byte", len);
+            let len = desc_chain
+                .memory()
+                .write(ev_data, descriptor.addr())
+                .unwrap();
 
             if vring.add_used(desc_chain.head_index(), len as u32).is_err() {
                 println!("Couldn't return used descriptors to the ring");
             }
+
+            println!("send event: {:?} len: {}", event, len);
         }
+
+        index = 0;
+        while index < last_sync_index {
+            println!("Remove index:{}", index);
+            self.ev_list.remove(0);
+            println!("Remove result list: {:?}", self.ev_list);
+            index += 1;
+        }
+
+        println!("ev list: {:?}", self.ev_list);
+
+        Ok(true)
+    }
+
+    /// Process the requests in the vring and dispatch replies
+    fn process_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
+        println!("Before fetch event");
+        let evs = self.ev_dev.fetch_events().unwrap();
+        println!("After fetch event");
+
+        for ev in evs {
+            let ev_raw_data = VuInputEvent {
+                ev_type: ev.event_type().0,
+                code: ev.code(),
+                value: ev.value() as u32,
+            };
+            println!("Add event to list: {ev_raw_data:?}");
+            self.ev_list.push_back(ev_raw_data);
+        }
+
+        self.process_event_list(vring)?;
 
         vring
             .signal_used_queue()
@@ -418,31 +426,26 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
             return Err(VuInputError::HandleEventNotEpollIn.into());
         }
 
-        //let evs = self.ev_dev.fetch_events().unwrap();
+        println!("device_event: {}", device_event);
 
-        //for ev in evs {
-        //    let ev_raw_data = VuInputEvent {
-        //        ev_type: ev.event_type().0,
-        //        code: ev.code(),
-        //        value: ev.value() as u32,
-        //    };
-        //    println!("push event: {ev_raw_data:?}");
-        //    self.ev_list.push(ev_raw_data);
-        //}
+        if device_event == 3 {
+            let vring = &vrings[0];
 
-        let vring = &vrings[0];
-
-        self.process_queue(vring)?;
-
-        //let mut requests = vring
-        //    .get_mut()
-        //    .get_queue_mut()
-        //    .iter(mem)
-        //    .map_err(|_| VuInputError::DescriptorNotFound)
-        //    .unwrap();
-
-        //let mut item = requests.next();
-        //println!("item:{:?}", item);
+            if self.event_idx {
+                // vm-virtio's Queue implementation only checks avail_index
+                // once, so to properly support EVENT_IDX we need to keep
+                // calling process_queue() until it stops finding new
+                // requests on the queue.
+                //loop {
+                vring.disable_notification().unwrap();
+                self.process_queue(vring)?;
+                vring.enable_notification().unwrap();
+                //}
+            } else {
+                // Without EVENT_IDX, a single call is enough.
+                self.process_queue(vring)?;
+            }
+        }
 
         println!("handle_event: exit!");
 
