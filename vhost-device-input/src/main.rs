@@ -9,7 +9,7 @@ mod vhu_input;
 use log::{error, info, warn};
 use std::os::fd::AsRawFd;
 use std::process::exit;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 
 use clap::Parser;
@@ -34,8 +34,8 @@ pub(crate) enum Error {
     CouldNotCreateBackend(std::io::Error),
     #[error("Could not create daemon: {0}")]
     CouldNotCreateDaemon(vhost_user_backend::Error),
-    #[error("Failed while parsing to String")]
-    ParseFailure,
+    #[error("Could not register input event into epoll")]
+    CouldNotRegisterInputEvent,
 }
 
 #[derive(Clone, Parser, Debug, PartialEq)]
@@ -72,8 +72,6 @@ impl TryFrom<InputArgs> for VuInputConfig {
             count += 1;
         }
 
-        println!("events: {:?} count: {:?}", events, count);
-
         Ok(VuInputConfig {
             socket_path,
             events,
@@ -89,27 +87,24 @@ pub(crate) fn start_backend(config: VuInputConfig) -> Result<()> {
         let socket = format!("{}{}", config.socket_path.to_owned(), i);
         let event = config.events.get(i as usize).unwrap().clone();
 
-        println!("socket: {} event: {}", socket, event);
-
         let handle: JoinHandle<Result<()>> = thread::spawn(move || loop {
-            let event_owned = event.to_owned();
-            println!("event_owned: {:?}", event_owned);
+            let ev_dev = match evdev::Device::open(event.to_owned()) {
+                Ok(dev) => dev,
+                Err(err) => {
+                    error!("Failed to open event device {}, error is: {}", event, err);
+                    return Err(Error::AccessEventDeviceFile);
+                }
+            };
 
-            let ev_dev =
-                evdev::Device::open(event.to_owned()).map_err(|_| Error::AccessEventDeviceFile)?;
             let raw_fd = ev_dev.as_raw_fd();
 
-            println!("raw_fd: {}", raw_fd);
-
-            // If creating the VuRngBackend isn't successull there isn't much else to do than
+            // If creating the VuInputBackend isn't successull there isn't much else to do than
             // killing the thread, which .unwrap() does.  When that happens an error code is
             // generated and displayed by the runtime mechanic.  Killing a thread doesn't affect
             // the other threads spun-off by the daemon.
             let vu_input_backend = Arc::new(RwLock::new(
                 VuInputBackend::new(ev_dev).map_err(Error::CouldNotCreateBackend)?,
             ));
-
-            println!("Create daemon");
 
             let mut daemon = VhostUserDaemon::new(
                 String::from("vhost-device-input-backend"),
@@ -118,14 +113,10 @@ pub(crate) fn start_backend(config: VuInputConfig) -> Result<()> {
             )
             .map_err(Error::CouldNotCreateDaemon)?;
 
-            println!("XXXXXXXXXXXXXXX");
             let handlers = daemon.get_epoll_handlers();
-            let ret = handlers[0].register_listener(
-                raw_fd,
-                EventSet::IN,
-                vhu_input::EPOLL_IN_VRING_EVENT_ID,
-            );
-            println!("register_listener result: {:?}", ret);
+            handlers[0]
+                .register_listener(raw_fd, EventSet::IN, vhu_input::EPOLL_IN_VRING_EVENT_ID)
+                .map_err(|_| Error::CouldNotRegisterInputEvent)?;
 
             let listener = Listener::new(socket.clone(), true).unwrap();
             daemon.start(listener).unwrap();

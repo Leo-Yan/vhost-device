@@ -181,9 +181,7 @@ impl VuInputBackend {
 
         index = 0;
         while index < last_sync_index {
-            println!("Remove index:{}", index);
             self.ev_list.remove(0);
-            println!("Remove result list: {:?}", self.ev_list);
             index += 1;
         }
 
@@ -361,7 +359,6 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
-        println!("set_event_idx: enabled={}", enabled);
         dbg!(self.event_idx = enabled);
     }
 
@@ -369,7 +366,6 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         &mut self,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
     ) -> result::Result<(), io::Error> {
-        println!("update_memory");
         self.mem = Some(mem);
         Ok(())
     }
@@ -381,8 +377,6 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         vrings: &[VringRwLock],
         _thread_id: usize,
     ) -> result::Result<bool, io::Error> {
-        println!("handle_event");
-
         if self.event_idx == false {
             self.ev_dev.fetch_events().unwrap();
             return Ok(false);
@@ -391,8 +385,6 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         if evset != EventSet::IN {
             return Err(VuInputError::HandleEventNotEpollIn.into());
         }
-
-        println!("device_event: {}", device_event);
 
         if device_event == 3 {
             let vring = &vrings[0];
@@ -412,8 +404,6 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
                 self.process_queue(vring)?;
             }
         }
-
-        println!("handle_event: exit!");
 
         Ok(false)
     }
