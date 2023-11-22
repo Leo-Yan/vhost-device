@@ -18,18 +18,16 @@ use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_bindings::bindings::virtio_ring::{
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
 };
-use virtio_queue::{DescriptorChain, QueueOwnedT, QueueT};
-use vm_memory::{
-    Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
-};
+use virtio_queue::QueueT;
+use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
 type Result<T> = std::result::Result<T, VuInputError>;
-type InputDescriptorChain = DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap<()>>>;
 
 const QUEUE_SIZE: usize = 1024;
 const NUM_QUEUES: usize = 2;
+pub const EPOLL_IN_VRING_EVENT_ID: u64 = 3;
 
 const VIRTIO_INPUT_CFG_ID_NAME: u8 = 0x01;
 const VIRTIO_INPUT_CFG_ID_DEVIDS: u8 = 0x03;
@@ -66,8 +64,6 @@ pub(crate) struct VuInputEvent {
 #[derive(Debug, Eq, PartialEq, ThisError)]
 /// Errors related to vhost-device-rng daemon.
 pub(crate) enum VuInputError {
-    #[error("Descriptor not found")]
-    DescriptorNotFound,
     #[error("Notification send failed")]
     SendNotificationFailed,
     #[error("Can't create eventFd")]
@@ -80,12 +76,10 @@ pub(crate) enum VuInputError {
     UnexpectedDescriptorCount(usize),
     #[error("Unexpected Read Descriptor")]
     UnexpectedReadDescriptor,
-    #[error("Failed to access input device")]
-    UnexpectedInputDeviceAccessError,
     #[error("Failed to read from the input device")]
     UnexpectedInputDeviceError,
-    #[error("Previous Time value is later than current time")]
-    UnexpectedTimerValue,
+    #[error("Failed to write event to vring")]
+    UnexpectedWriteVringError,
 }
 
 ioctl_read_buf!(eviocgname, b'E', 0x06, u8);
@@ -128,19 +122,7 @@ impl VuInputBackend {
         })
     }
 
-    pub fn process_requests(
-        &mut self,
-        requests: Vec<InputDescriptorChain>,
-        vring: &VringRwLock,
-    ) -> Result<bool> {
-        if requests.is_empty() {
-            return Ok(true);
-        }
-
-        Ok(true)
-    }
-
-    fn process_event_list(&mut self, vring: &VringRwLock) -> Result<bool> {
+    fn process_event(&mut self, vring: &VringRwLock) -> Result<bool> {
         let mut index = 0;
         let mut last_sync_index = 0;
 
@@ -151,15 +133,14 @@ impl VuInputBackend {
             }
         }
 
-        println!("last_sync_index: {}", last_sync_index);
-
         index = 0;
         while index < last_sync_index {
             let event: &VuInputEvent;
+            let desc_chain;
+            let descriptors: Vec<_>;
+            let descriptor;
             event = self.ev_list.get(index).unwrap();
             index += 1;
-
-            println!("send event: {event:?}");
 
             let mem = self.mem.as_ref().unwrap().memory();
 
@@ -168,31 +149,24 @@ impl VuInputBackend {
                 .get_queue_mut()
                 .pop_descriptor_chain(mem.clone());
 
-            match desc {
-                None => {
-                    self.ev_list.clear();
+            if desc.is_none() {
+                self.ev_list.clear();
 
-                    vring
-                        .signal_used_queue()
-                        .map_err(|_| VuInputError::SendNotificationFailed)?;
+                vring
+                    .signal_used_queue()
+                    .map_err(|_| VuInputError::SendNotificationFailed)?;
 
-                    return Ok(false);
+                return Err(VuInputError::UnexpectedReadDescriptor);
+            } else {
+                desc_chain = desc.unwrap();
+                descriptors = desc_chain.clone().collect();
+                if descriptors.len() != 1 {
+                    return Err(VuInputError::UnexpectedDescriptorCount(descriptors.len()));
                 }
-                _ => (),
+                descriptor = descriptors[0];
             }
 
-            let desc_chain = desc.unwrap();
-
-            let descriptors: Vec<_> = desc_chain.clone().collect();
-
-            if descriptors.len() != 1 {
-                println!("desc length is not 1");
-            }
-
-            let descriptor = descriptors[0];
             let ev_data = unsafe { any_as_u8_slice(event) };
-
-            println!("event_data: {:?}", ev_data);
 
             let len = desc_chain
                 .memory()
@@ -200,10 +174,9 @@ impl VuInputBackend {
                 .unwrap();
 
             if vring.add_used(desc_chain.head_index(), len as u32).is_err() {
-                println!("Couldn't return used descriptors to the ring");
+                println!("Couldn't write event data to the ring");
+                return Err(VuInputError::UnexpectedWriteVringError);
             }
-
-            println!("send event: {:?} len: {}", event, len);
         }
 
         index = 0;
@@ -214,16 +187,12 @@ impl VuInputBackend {
             index += 1;
         }
 
-        println!("ev list: {:?}", self.ev_list);
-
         Ok(true)
     }
 
     /// Process the requests in the vring and dispatch replies
     fn process_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
-        println!("Before fetch event");
         let evs = self.ev_dev.fetch_events().unwrap();
-        println!("After fetch event");
 
         for ev in evs {
             let ev_raw_data = VuInputEvent {
@@ -231,11 +200,10 @@ impl VuInputBackend {
                 code: ev.code(),
                 value: ev.value() as u32,
             };
-            println!("Add event to list: {ev_raw_data:?}");
             self.ev_list.push_back(ev_raw_data);
         }
 
-        self.process_event_list(vring)?;
+        self.process_event(vring)?;
 
         vring
             .signal_used_queue()
@@ -340,12 +308,10 @@ impl VuInputBackend {
 /// VhostUserBackend trait methods
 impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
     fn num_queues(&self) -> usize {
-        println!("num_queues");
         NUM_QUEUES
     }
 
     fn max_queue_size(&self) -> usize {
-        println!("max_queue_size");
         QUEUE_SIZE
     }
 
@@ -360,7 +326,7 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG
     }
 
-    fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
+    fn get_config(&self, _offset: u32, size: u32) -> Vec<u8> {
         let cfg;
 
         match self.select {
@@ -387,7 +353,7 @@ impl VhostUserBackendMut<VringRwLock, ()> for VuInputBackend {
         }
     }
 
-    fn set_config(&mut self, offset: u32, buf: &[u8]) -> io::Result<()> {
+    fn set_config(&mut self, _offset: u32, buf: &[u8]) -> io::Result<()> {
         self.select = buf[0];
         self.subsel = buf[1];
 
